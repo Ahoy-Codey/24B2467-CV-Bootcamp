@@ -1,24 +1,24 @@
 {
   "name": "Nihar",
-  "roll_no": "24B2467",
+  "roll_no": "24b2467",
   "seed": 0,
   "training_setup": {
     "optimizer": "SGD (momentum 0.9, weight decay 0.0005), lr 0.1",
     "learning_rate_schedule": "cosine annealing per epoch from 0.1 to ~0 over 60 epochs (no restarts)",
     "batch_size": 128,
     "epochs": 60,
-    "augmentation": "random crop 32x32 with 4-px zero padding + random horizontal flip",
+    "augmentation": "random crop 32x32 with 4-px zero padding + random horizontal flip (val/test predictions average the image and its horizontal flip)",
     "gpu_used": "2x Tesla T4 (Kaggle)"
   },
   "task1": {
     "noise_rate": 0.402422,
-    "val_acc_noisy_labels__clean_ref_model": 0.5934,
-    "val_acc_noisy_labels__noisy_ce_model": 0.507
+    "val_acc_noisy_labels__clean_ref_model": 0.5938,
+    "val_acc_noisy_labels__noisy_ce_model": 0.5186
   },
   "task2": {
-    "memorization_start_epoch": 37,
-    "early_stop_epoch": 33,
-    "val_acc_noisy_labels_at_early_stop": 0.5512
+    "memorization_start_epoch": 38,
+    "early_stop_epoch": 45,
+    "val_acc_noisy_labels_at_early_stop": 0.562
   },
   "task3": {
     "method": "rank-average ensemble of 3 signals: (a) 3-fold cross-validated confidence 1-p(noisy label), (b) negative area-under-margin of the Task-1 CE run up to the early-stop epoch, (c) DivideMix per-sample loss (2 nets) - 5 training runs total"
@@ -28,23 +28,23 @@
       {
         "name": "divmix",
         "file": "t4_divmix.csv",
-        "val_acc_noisy_labels": 0.575
+        "val_acc_noisy_labels": 0.5762
       },
       {
         "name": "elr",
         "file": "t4_elr.csv",
-        "val_acc_noisy_labels": 0.5774
+        "val_acc_noisy_labels": 0.5848
       },
       {
-        "name": "gce",
-        "file": "t4_gce.csv",
-        "val_acc_noisy_labels": 0.5702
+        "name": "elrmix",
+        "file": "t4_elrmix.csv",
+        "val_acc_noisy_labels": 0.5894
       }
     ],
-    "best_method": "elr"
+    "best_method": "elrmix"
   },
   "task5": {
-    "val_acc_synthetic_labels__baseline": 0.4262,
-    "val_acc_synthetic_labels__best_method": 0.535
+    "val_acc_synthetic_labels__baseline": 0.4574,
+    "val_acc_synthetic_labels__best_method": 0.5466
   }
 }

@@ -125,8 +125,10 @@ def make_opt(net, cfg):
 
 
 @torch.no_grad()
-def predict_logits(nets, data, ids=None, test=False, bs=1024, amp=True):
-    """Average softmax of one or several nets (eval mode, no augmentation). Returns (probs, logits_of_first_net)."""
+def predict_logits(nets, data, ids=None, test=False, bs=1024, amp=True, tta=False):
+    """Average softmax of one or several nets (eval mode, no augmentation).
+    tta=True also averages over the horizontally flipped image (test-time augmentation; used for val/test predictions).
+    Returns (probs, logits_of_first_net_on_unflipped_images)."""
     if not isinstance(nets, (list, tuple)):
         nets = [nets]
     for n in nets:
@@ -139,10 +141,15 @@ def predict_logits(nets, data, ids=None, test=False, bs=1024, amp=True):
     probs, logits0 = [], []
     for i in range(0, len(ids_t), bs):
         x = data.to_input(src[ids_t[i:i + bs]])
-        with autocast(data.device, amp):
-            outs = [n(x).float() for n in nets]
-        probs.append(torch.stack([F.softmax(o, 1) for o in outs]).mean(0).cpu())
-        logits0.append(outs[0].cpu())
+        views = [x, x.flip(3).contiguous(memory_format=torch.channels_last)] if tta else [x]
+        ps = []
+        for vi, v in enumerate(views):
+            with autocast(data.device, amp):
+                outs = [n(v).float() for n in nets]
+            ps += [F.softmax(o, 1) for o in outs]
+            if vi == 0:
+                logits0.append(outs[0].cpu())
+        probs.append(torch.stack(ps).mean(0).cpu())
     return torch.cat(probs).numpy(), torch.cat(logits0).numpy()
 
 
@@ -172,6 +179,19 @@ class ELR:
         reg = torch.log(1.0 - (self.t[ids] * p).sum(1)).mean()
         return F.cross_entropy(logits, y) + self.lam * reg
 
+    @torch.no_grad()
+    def update(self, ids, probs):
+        p = probs.clamp(1e-4, 1.0 - 1e-4)
+        self.t[ids] = self.beta * self.t[ids] + (1.0 - self.beta) * (p / p.sum(1, keepdim=True))
+
+    def mix_loss(self, logits, y, ids, lam, perm):
+        """ELR on a mixup batch (as in ELR+): mixed CE + ELR term against the mixed running targets."""
+        p = F.softmax(logits, 1).clamp(1e-4, 1.0 - 1e-4)
+        ce = lam * F.cross_entropy(logits, y) + (1 - lam) * F.cross_entropy(logits, y[perm])
+        tm = lam * self.t[ids] + (1 - lam) * self.t[ids[perm]]
+        reg = torch.log(1.0 - (tm * p).sum(1)).mean()
+        return ce + self.lam * reg
+
 
 # ----------------------------------------------------------------------------- evaluation helpers
 def val_metrics(probs_val, data, sel_key):
@@ -189,14 +209,15 @@ def save_json(obj, path):
         json.dump(obj, f, indent=1)
 
 
-# ----------------------------------------------------------------------------- single-network training
+# ----------------------------------------------------------------------------- single/ensemble training
 def run_single(data, cfg, out_dir, method, label_key, train_ids, seed,
-               dynamics=False, heldout_ids=None, fh=None):
-    """Train one ResNet-18 for cfg['epochs'] epochs.
+               dynamics=False, heldout_ids=None, fh=None, n_nets=1):
+    """Train `n_nets` ResNet-18s (seeds seed, seed+1) for cfg['epochs'] epochs; predictions average their softmax.
 
-    method     : 'ce' | 'gce' | 'elr'
+    method     : 'ce' | 'gce' | 'elr' | 'elr_mix' (ELR + mixup, as in ELR+)
     label_key  : which label column is used for TRAINING ('clean' only for the Task-1 reference)
     Checkpoint selection uses noisy val labels (or synthetic val labels when training on synthetic).
+    Val/test predictions use horizontal-flip test-time augmentation.
     dynamics   : log Task-2 curves + per-sample margins/losses on the training set (eval mode, no aug)
     heldout_ids: Task-3 cross-validation - store held-out probabilities at the best (noisy-val) epoch
     """
@@ -206,16 +227,18 @@ def run_single(data, cfg, out_dir, method, label_key, train_ids, seed,
     y_all = torch.from_numpy(data.labels[label_key]).to(dev)
     tr = torch.as_tensor(train_ids, device=dev)
     n, B, E = len(tr), cfg["batch_size"], cfg["epochs"]
+    assert not (dynamics and n_nets != 1)
+    mix_alpha = cfg.get("mixup_alpha", 1.0)
 
-    net = new_net(seed, dev)
-    opt = make_opt(net, cfg)
-    scaler = make_scaler(amp)
+    nets = [new_net(seed + k, dev) for k in range(n_nets)]
+    opts = [make_opt(nt, cfg) for nt in nets]
+    scalers = [make_scaler(amp) for _ in nets]
     if method == "ce":
-        crit = loss_ce
+        crits = [loss_ce] * n_nets
     elif method == "gce":
-        crit = loss_gce
-    elif method == "elr":
-        crit = ELR(len(data.labels["noisy"]), dev)
+        crits = [loss_gce] * n_nets
+    elif method in ("elr", "elr_mix"):
+        crits = [ELR(len(data.labels["noisy"]), dev) for _ in nets]
     else:
         raise ValueError(method)
 
@@ -229,38 +252,50 @@ def run_single(data, cfg, out_dir, method, label_key, train_ids, seed,
     t0 = time.time()
     for ep in range(E):
         lr = cosine_lr(cfg, ep)
-        for g in opt.param_groups:
-            g["lr"] = lr
-        net.train()
-        perm = tr[torch.randperm(n, device=dev)]
-        tot_loss, nb = 0.0, 0
-        for i in range(0, n - B + 1, B):                       # drop_last
-            ids = perm[i:i + B]
-            x = data.augment(data.X[ids])
-            y = y_all[ids]
-            with autocast(dev, amp):
-                logits = net(x)
-            loss = crit(logits.float(), y, ids=ids)
-            opt.zero_grad(set_to_none=True)
-            scaler.scale(loss).backward()
-            scaler.step(opt)
-            scaler.update()
-            tot_loss += loss.item() if (nb % 50 == 0) else 0.0
-            nb += 1
-        # ---- end of epoch evaluation
-        pv, _ = predict_logits(net, data, data.val_idx, amp=amp)
+        for k in range(n_nets):
+            net, opt, scaler, crit = nets[k], opts[k], scalers[k], crits[k]
+            for g in opt.param_groups:
+                g["lr"] = lr
+            net.train()
+            perm_all = tr[torch.randperm(n, device=dev)]
+            for i in range(0, n - B + 1, B):                       # drop_last
+                ids = perm_all[i:i + B]
+                x = data.augment(data.X[ids])
+                y = y_all[ids]
+                if method == "elr_mix":
+                    with torch.no_grad():
+                        with autocast(dev, amp):
+                            p_clean = F.softmax(net(x).float(), 1)
+                    crit.update(ids, p_clean)                       # ELR targets from the un-mixed view
+                    lam = float(np.random.beta(mix_alpha, mix_alpha))
+                    lam = max(lam, 1.0 - lam)
+                    pm = torch.randperm(B, device=dev)
+                    xm = (lam * x + (1.0 - lam) * x[pm]).contiguous(memory_format=torch.channels_last)
+                    with autocast(dev, amp):
+                        logits = net(xm)
+                    loss = crit.mix_loss(logits.float(), y, ids, lam, pm)
+                else:
+                    with autocast(dev, amp):
+                        logits = net(x)
+                    loss = crit(logits.float(), y, ids=ids)
+                opt.zero_grad(set_to_none=True)
+                scaler.scale(loss).backward()
+                scaler.step(opt)
+                scaler.update()
+        # ---- end of epoch evaluation (ensemble of all nets, flip TTA)
+        pv, _ = predict_logits(nets, data, data.val_idx, amp=amp, tta=True)
         m = val_metrics(pv, data, sel_key)
         m.update(epoch=ep + 1, lr=lr)
-        pt, _ = predict_logits(net, data, test=True, amp=amp)
+        pt, _ = predict_logits(nets, data, test=True, amp=amp, tta=True)
         test_pred = pt.argmax(1)
         if m["val_acc_sel"] > best["val_acc_sel"]:              # earliest best (strict >)
             best = dict(m)
             np.save(os.path.join(out_dir, "test_pred_best.npy"), test_pred)
             if heldout_ids is not None:
-                ph, _ = predict_logits(net, data, heldout_ids, amp=amp)
+                ph, _ = predict_logits(nets, data, heldout_ids, amp=amp, tta=True)
                 heldout_best = ph
         if dynamics:
-            ptr, ltr = predict_logits(net, data, train_ids, amp=amp)
+            ptr, ltr = predict_logits(nets[0], data, train_ids, amp=amp)
             pred_tr = ptr.argmax(1)
             m["train_acc_correct"] = acc(pred_tr[~mislab], y_noisy_tr[~mislab])
             m["train_acc_mislabeled"] = acc(pred_tr[mislab], y_noisy_tr[mislab])  # fit to the WRONG label
@@ -273,7 +308,7 @@ def run_single(data, cfg, out_dir, method, label_key, train_ids, seed,
         hist.append(m)
         extra = (f" | tr_correct {m['train_acc_correct']:.4f} tr_mislab {m['train_acc_mislabeled']:.4f}"
                  if dynamics else "")
-        log(f"[{method}/{label_key}] ep {ep + 1:2d}/{E} lr {lr:.4f} "
+        log(f"[{method}x{n_nets}/{label_key}] ep {ep + 1:2d}/{E} lr {lr:.4f} "
             f"val_noisy {m['val_acc_noisy']:.4f} val_synth {m['val_acc_synthetic']:.4f} "
             f"val_clean {m['val_acc_clean']:.4f}{extra} ({time.time() - t0:.0f}s)", fh)
     np.save(os.path.join(out_dir, "test_pred_final.npy"), test_pred)
@@ -283,7 +318,7 @@ def run_single(data, cfg, out_dir, method, label_key, train_ids, seed,
     if heldout_ids is not None:
         np.save(os.path.join(out_dir, "heldout_ids.npy"), np.asarray(heldout_ids))
         np.save(os.path.join(out_dir, "heldout_probs_best.npy"), heldout_best)
-    res = {"method": method, "label_key": label_key, "sel_key": sel_key, "epochs": E,
+    res = {"method": method, "n_nets": n_nets, "label_key": label_key, "sel_key": sel_key, "epochs": E,
            "history": hist, "best": best, "final": hist[-1], "seconds": time.time() - t0}
     save_json(res, os.path.join(out_dir, "result.json"))
     return res
@@ -419,10 +454,10 @@ def run_divmix(data, cfg, out_dir, label_key, train_ids, seed, fh=None):
             probs = [gmm_clean_prob(per_sample_loss(nets[k], data, tr_np, y_tr_np, amp)) for k in (0, 1)]
             n_lab[0] = train_epoch(0, probs[1], ep)   # net1 uses net2's division
             n_lab[1] = train_epoch(1, probs[0], ep)   # net2 uses net1's division
-        pv, _ = predict_logits(nets, data, data.val_idx, amp=amp)
+        pv, _ = predict_logits(nets, data, data.val_idx, amp=amp, tta=True)
         m = val_metrics(pv, data, sel_key)
         m.update(epoch=ep + 1, lr=lr, n_labeled=n_lab)
-        pt, _ = predict_logits(nets, data, test=True, amp=amp)
+        pt, _ = predict_logits(nets, data, test=True, amp=amp, tta=True)
         test_pred = pt.argmax(1)
         if m["val_acc_sel"] > best["val_acc_sel"]:
             best = dict(m)

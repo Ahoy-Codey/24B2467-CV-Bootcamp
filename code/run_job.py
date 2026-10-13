@@ -5,8 +5,8 @@ Jobs (each trains ResNet-18 from scratch, <= 60 epochs per network):
   t1_noisy        Task 1+2 CE on noisy labels, logs dynamics, early-stop predictions, Task-3 margins
   t3_fold{0,1,2}  Task 3  3-fold cross-validation (CE, noisy labels) -> out-of-fold probabilities
   t4_divmix       Task 4  DivideMix (2 networks)
-  t4_elr          Task 4  Early-Learning Regularisation
-  t4_gce          Task 4  Generalized Cross-Entropy
+  t4_elr          Task 4  Early-Learning Regularisation (2-network ensemble)
+  t4_elrmix       Task 4  ELR + mixup (as in ELR+), 2-network ensemble
   t5_base_synth   Task 5  CE baseline on synthetic labels
   t5_best_synth   Task 5  best Task-4 method (by noisy val acc) on synthetic labels
 """
@@ -21,7 +21,8 @@ import torch
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 import nlib  # noqa: E402
 
-T4_METHODS = ["divmix", "elr", "gce"]
+T4_METHODS = ["divmix", "elr", "elrmix"]
+T4_SPEC = {"elr": ("elr", 2), "elrmix": ("elr_mix", 2)}   # job suffix -> (nlib method, n networks)
 
 
 def best_t4_method(out_root):
@@ -79,8 +80,9 @@ def main():
         nlib.run_single(data, cfg, out_dir, "ce", "noisy", train_part, seed, heldout_ids=held, fh=fh)
     elif j == "t4_divmix":
         nlib.run_divmix(data, cfg, out_dir, "noisy", tr, seed, fh=fh)
-    elif j in ("t4_elr", "t4_gce"):
-        nlib.run_single(data, cfg, out_dir, j[3:], "noisy", tr, seed, fh=fh)
+    elif j[3:] in T4_SPEC:
+        meth, k = T4_SPEC[j[3:]]
+        nlib.run_single(data, cfg, out_dir, meth, "noisy", tr, seed, fh=fh, n_nets=k)
     elif j == "t5_base_synth":
         nlib.run_single(data, cfg, out_dir, "ce", "synthetic", tr, seed, fh=fh)
     elif j == "t5_best_synth":
@@ -91,7 +93,8 @@ def main():
         if m == "divmix":
             nlib.run_divmix(data, cfg, out_dir, "synthetic", tr, seed, fh=fh)
         else:
-            nlib.run_single(data, cfg, out_dir, m, "synthetic", tr, seed, fh=fh)
+            meth, k = T4_SPEC[m]
+            nlib.run_single(data, cfg, out_dir, meth, "synthetic", tr, seed, fh=fh, n_nets=k)
     else:
         raise ValueError("unknown job " + j)
     open(done_flag, "w").write("ok")

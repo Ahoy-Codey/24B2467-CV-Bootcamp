@@ -20,9 +20,9 @@ CLASSES_FALLBACK = ["airplane", "automobile", "bird", "cat", "deer", "dog", "fro
 # priority order; a job starts as soon as a GPU is free and its dependencies are finished
 JOBS = [
     ("t4_divmix", []),
+    ("t4_elrmix", []),
     ("t4_elr", []),
-    ("t4_gce", []),
-    ("t5_best_synth", ["t4_divmix", "t4_elr", "t4_gce"]),
+    ("t5_best_synth", ["t4_divmix", "t4_elr", "t4_elrmix"]),
     ("t1_noisy", []),
     ("t1_clean", []),
     ("t5_base_synth", []),
@@ -36,7 +36,7 @@ def default_cfg(data_dir, out_root, seed=0, epochs=60):
     return {
         "data_dir": data_dir, "out_root": out_root, "seed": seed,
         "epochs": epochs, "batch_size": 128, "lr": 0.1, "momentum": 0.9, "weight_decay": 5e-4,
-        "amp": True, "n_folds": 3,
+        "amp": True, "n_folds": 3, "mixup_alpha": 1.0,
         "divmix": {"warmup": 10, "T": 0.5, "alpha": 4.0, "lambda_u": 25.0, "p_threshold": 0.5},
     }
 
@@ -158,7 +158,7 @@ def words(text):
     return len(text.split())
 
 
-METHOD_NAMES = {"divmix": "DivideMix", "elr": "ELR (early-learning regularisation)", "gce": "GCE (generalized cross-entropy)"}
+METHOD_NAMES = {"divmix": "DivideMix", "elr": "ELR (2-net ensemble)", "elrmix": "ELR+mixup (2-net ensemble)"}
 
 
 # ----------------------------------------------------------------------------- assemble submission
@@ -273,7 +273,7 @@ def assemble(cfg, name, roll_no, sub_root, gpu_name="", checker_dir=None):
 
     # ---------------- Task 4
     t4 = []
-    for mth in ["divmix", "elr", "gce"]:
+    for mth in ["divmix", "elr", "elrmix"]:
         d = os.path.join(out, f"t4_{mth}")
         r = rjson(os.path.join(d, "result.json"))
         fname = f"t4_{mth}.csv"
@@ -298,7 +298,7 @@ def assemble(cfg, name, roll_no, sub_root, gpu_name="", checker_dir=None):
             "optimizer": f"SGD (momentum {cfg['momentum']}, weight decay {cfg['weight_decay']}), lr {cfg['lr']}",
             "learning_rate_schedule": f"cosine annealing per epoch from {cfg['lr']} to ~0 over {cfg['epochs']} epochs (no restarts)",
             "batch_size": int(cfg["batch_size"]), "epochs": int(cfg["epochs"]),
-            "augmentation": "random crop 32x32 with 4-px zero padding + random horizontal flip",
+            "augmentation": "random crop 32x32 with 4-px zero padding + random horizontal flip (val/test predictions average the image and its horizontal flip)",
             "gpu_used": gpu_name or "GPU",
         },
         "task1": {
@@ -357,8 +357,9 @@ def assemble(cfg, name, roll_no, sub_root, gpu_name="", checker_dir=None):
                    "with co-guessed targets still learns from noisy images instead of memorizing them."),
         "elr": ("ELR pulls predictions towards a running average of the model's own early predictions, so gradients from "
                 "wrong labels are cancelled once the early-learning phase has captured the clean signal, slowing memorization."),
-        "gce": ("GCE interpolates between CE and MAE; it down-weights samples with low predicted probability for their label, "
-                "which are mostly mislabeled, so they contribute small gradients and are memorized less."),
+        "elrmix": ("ELR keeps predictions close to the model's own early (mostly correct) predictions, cancelling gradients from "
+                   "wrong labels; mixup blends images and labels, so no single wrong label can be memorized exactly; "
+                   "averaging two networks reduces variance."),
     }[best]
     others = ", ".join(f"{x['name']} {pct(x['val_acc_noisy_labels'])}" for x in t4 if x["name"] != best)
     bv = b["val_acc_noisy_labels"]

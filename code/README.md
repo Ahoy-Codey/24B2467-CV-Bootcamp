@@ -6,7 +6,7 @@ No pretrained weights or external data are used. The seed is 0.
 ## Files
 | file | purpose |
 |---|---|
-| `nlib.py` | data loading (all images kept on the GPU, GPU augmentation), CE/GCE/ELR single-network training, DivideMix (2 networks) |
+| `nlib.py` | data loading (all images kept on the GPU, GPU augmentation), CE / ELR / ELR+mixup training (1 or 2 networks), DivideMix (2 networks) |
 | `run_job.py` | runs one training job, e.g. `python run_job.py --job t1_noisy --cfg cfg.json` |
 | `pipeline.py` | job scheduler (one job per GPU, in parallel) and assembly of `predictions/`, `results.json`, `report.md` |
 | `run_all.py` | command-line entry point for the whole pipeline |
@@ -15,6 +15,7 @@ No pretrained weights or external data are used. The seed is 0.
 ## Shared training recipe (baseline and all methods)
 SGD with momentum 0.9 and weight decay 5e-4. Learning rate 0.1 with cosine annealing per epoch over 60 epochs. Batch size 128.
 Augmentation is a random 32x32 crop with 4-px zero padding plus a horizontal flip. Training uses fp16 mixed precision.
+All validation and test predictions average the image and its horizontal flip (test-time augmentation), for every model.
 Each network trains for 60 epochs.
 
 ## Reproduce everything (one command)
@@ -33,7 +34,7 @@ Then run the jobs below, each with `python run_job.py --job <job> --cfg cfg.json
 | Task 1 | `t1_clean` (CE on clean labels, reference), `t1_noisy` (CE on noisy labels) | `t1_clean_ref.csv`, `t1_noisy_ce.csv` (final epoch 60) |
 | Task 2 | `t1_noisy` (logs the dynamics every epoch) | `t2_dynamics.csv`, `t2_early_stop.csv` (epoch with the best **noisy** val acc) |
 | Task 3 | `t3_fold0..2` (3-fold CV), `t1_noisy`, `t4_divmix`: 5 training runs | `t3_noise_scores.csv` |
-| Task 4 | `t4_divmix`, `t4_elr`, `t4_gce` | `t4_divmix.csv`, `t4_elr.csv`, `t4_gce.csv` (checkpoint with the best noisy val acc) |
+| Task 4 | `t4_divmix` (DivideMix, 2 nets), `t4_elr` (ELR, 2-net ensemble), `t4_elrmix` (ELR + mixup, 2-net ensemble) | `t4_divmix.csv`, `t4_elr.csv`, `t4_elrmix.csv` (checkpoint with the best noisy val acc) |
 | Task 5 | `t5_base_synth` (CE, final epoch), `t5_best_synth` (best Task-4 method, checkpoint chosen on synthetic val) | `t5_baseline_synth.csv`, `t5_best_synth.csv` |
 
 ## Task 3 score
