@@ -1,0 +1,11 @@
+# Report - Learning from Messy Human Labels (CIFAR-10N)
+
+Q1. Noise rate is 40.2% (18109 of 45000 training labels). Three class pairs, automobile<->truck (2373), cat<->dog (1758), deer<->horse (916), cause 27.9% of all wrong labels. The biggest single directions are truck->automobile (1247), automobile->truck (1126), cat->dog (924). The noise is structured, not uniform: 72.0% of wrong labels stay within the same super-group (animal->animal or vehicle->vehicle).
+
+Q2. Memorization starts around epoch 37. Training accuracy on the mislabeled subset (fit to the wrong label) bottoms out near 12.0% at epoch 13; from epoch 37 it stays 5+ points higher and climbs to 66.7% by epoch 60, while correct-subset accuracy reaches 97.2%. Clean-label validation accuracy peaks at epoch 39 (79.3%) and falls to 69.3% at the end. Noisy-label validation accuracy peaks at epoch 33, which we use for early stopping.
+
+Q3. On our own clean-label check, the best single signal was DivideMix loss (AUROC 0.965); the submitted rank ensemble scores AUROC 0.969, precision@k 0.887. Failure mode: systematic human confusions. For 68.2% of missed wrong labels the held-out model itself predicts the wrong label, because the image genuinely looks like that class (most missed: truck->automobile, cat->dog), so its loss stays low.
+
+Q4. Best was ELR (early-learning regularisation): noisy-val 57.7% (clean-val 85.1%) vs CE 50.7% final / 55.1% early-stopped; others: divmix 57.5%, gce 57.0%. It helped, beating both final and early-stopped CE. ELR pulls predictions towards a running average of the model's own early predictions, so gradients from wrong labels are cancelled once the early-learning phase has captured the clean signal, slowing memorization.
+
+Q5. Measured by clean-label validation accuracy, elr vs CE baseline is +15.8 points on human noise and +20.7 on synthetic noise (CE baseline: 69.3% real, 69.5% synthetic). The ranking did not change; the gap is larger on synthetic noise. Symmetric noise is random and feature-independent, so wrong labels conflict with the image, have high loss and are easy to separate. Human noise sits in ambiguous look-alike pairs, so wrong labels look plausible, are learned like signal and are harder to filter.
